@@ -1,0 +1,6 @@
+A bytecode generator for LuaJIT2
+
+This code is pre alpha.
+
+See the test files for examples.
+
