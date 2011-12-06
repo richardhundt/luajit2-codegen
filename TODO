@@ -1,0 +1,8 @@
+* tail calls
+* loop instructions
+* constant tables
+* op_self()
+* op_setlist()
+* PUC Lua bytecode port
+* documentation
+
