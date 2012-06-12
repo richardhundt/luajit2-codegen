@@ -1,5 +1,6 @@
-* tail calls
-* loop instructions
+* tail calls (needs testing)
+* LOOP
+* ITERC/ITERL
 * constant tables
 * op_self()
 * op_setlist()

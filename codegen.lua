@@ -25,6 +25,7 @@
 
 local DEBUG = true
 local bit = require 'bit'
+local ffi = require 'ffi'
 
 local typeof = getmetatable
 
@@ -111,61 +112,117 @@ local FOR_GEN   = "(for generator)";
 local FOR_STATE = "(for state)";
 local FOR_CTL   = "(for control)";
 
-Buf = class { __name = 'Buf' }
-function Buf:__init(tab)
-   if tab ~= nil then
-      for i=1, #tab do self[#self + 1] = tab[i] end
+ffi.cdef[[
+   void *malloc(size_t);
+   void *realloc(void*, size_t);
+   int free(void*);
+
+   typedef struct Buf {
+     size_t size;
+     size_t offs;
+     uint8_t *data;
+   } Buf;
+]]
+
+Buf = { }
+Buf.new = function(size)
+   if not size then
+      size = 32
+   end
+   local self = ffi.new('Buf', size)
+   self.data  = ffi.C.malloc(size)
+   self.offs  = 0
+   return self
+end
+Buf.__gc = function(self)
+   ffi.C.free(self.data)
+end
+Buf.__index = { }
+Buf.__index.need = function(self, size)
+   if self.size < self.offs + size then
+      local new_size = self.offs + size
+      while new_size < self.size do
+         new_size = new_size * 2
+      end
+      self.data = ffi.C.realloc(ffi.cast('void*', self.data), new_size)
+      self.size = new_size
    end
 end
-function Buf:put(v, o)
-   table.insert(self, o or #self + 1, v)
+Buf.__index.put = function(self, v)
+   self:need(1)
+   local offs = self.offs
+   self.data[offs] = ffi.cast('uint8_t', v)
+   self.offs = offs + 1
+   return offs
 end
-function Buf:put_uint8(v, o)
-   if not o then o = #self + 1 end
-   self:put(v % 256, o)
+Buf.__index.put_uint8 = Buf.__index.put
+
+local uint16_1 = ffi.typeof('uint16_t[1]')
+Buf.__index.put_uint16 = function(self, v)
+   self:need(2)
+   local offs = self.offs
+   local uint = uint16_1(v)
+   ffi.copy(self.data + offs, uint, 2)
+   self.offs = offs + 2
+   return offs
 end
-function Buf:put_uint16(v, o)
-   if not o then o = #self + 1 end
-   self:put(v % 256, o)
-   v = math.floor(v / 256)
-   self:put(v % 256, o + 1)
+
+local uint32_1 = ffi.typeof('uint32_t[1]')
+Buf.__index.put_uint32 = function(self, v)
+   self:need(4)
+   local offs = self.offs
+   local uint = uint32_1(v)
+   ffi.copy(self.data + offs, uint, 4)
+   self.offs = offs + 4
+   return offs
 end
-function Buf:put_uint32(v, o)
-   if not o then o = #self + 1 end
-   self:put(v % 256, o)
-   v = math.floor(v / 256)
-   self:put(v % 256, o + 1)
-   v = math.floor(v / 256)
-   self:put(v % 256, o + 2)
-   v = math.floor(v / 256)
-   self:put(v % 256, o + 3)
-end
-function Buf:put_uleb128(v, o)
-   if not o then o = #self + 1 end
-   local i = 0
+
+Buf.__index.put_uleb128 = function(self,  v)
+   v = tonumber(v)
+   local i, offs = 0, self.offs
    repeat
       local b = bit.band(v, 0x7f)
       v = bit.rshift(v, 7)
       if v ~= 0 then
          b = bit.bor(b, 0x80)
       end
-      self:put(b, o + i)
+      self:put(b)
       i = i + 1
    until v == 0
+   return offs
 end
-function Buf:put_literal(v, o)
-   if not o then o = #self + 1 end
-   for i=1, #v do
-      self:put(string.byte(v, i), o + i - 1)
+
+Buf.__index.put_bytes = function(self, v)
+   local offs = self.offs
+   self:need(#v)
+   ffi.copy(self.data + offs, v)
+   self.offs = offs + #v
+   return offs
+end
+Buf.__index.pack = function(self)
+   return ffi.string(self.data, self.offs)
+end
+
+local double_1 = ffi.typeof('double[1]')
+Buf.__index.put_number = function(self, v)
+   local offs = self.offs
+   local numv = double_1(v)
+   local char = ffi.cast('uint8_t*', numv)
+
+   local u32_lo, u32_hi = uint32_1(0), uint32_1(0)
+   ffi.copy(u32_lo, char, 4)
+   ffi.copy(u32_hi, char + 4, 4)
+
+   self:put_uleb128(1 + 2 * u32_lo[0]) -- 33 bits with lsb set
+   if u32_lo[0] >= 0x80000000 then
+      self.data[self.offs-1] = bit.bor(self.data[self.offs-1], 0x10)
    end
+   self:put_uleb128(u32_hi[0])
+
+   return offs
 end
-function Buf:pack()
-   local out = { }
-   for i=1, #self do
-      out[#out + 1] = string.char(self[i])
-   end
-   return table.concat(out)
-end
+
+ffi.metatype('Buf', Buf)
 
 Ins = class{ __name = 'Ins' }
 function Ins:__init(op, a, b, c)
@@ -193,6 +250,11 @@ function Ins:alloc(ctx)
       local arg = self[i]
       if type(arg) == 'table' and arg.idx then
          self[i] = arg.idx
+         if type(arg.args) == 'table' then
+            for i=1, #arg.args do
+               arg.args[i] = arg.idx + i
+            end
+         end
       elseif typeof(arg) == List then
          if arg.varg then
             self[i] = #ctx.params
@@ -200,7 +262,9 @@ function Ins:alloc(ctx)
             self[i] = #arg + 1
          end
       else
-         assert(type(arg) == "number")
+         if type(arg) ~= "number" then
+            error("bad instruction: "..tostring(self))
+         end
       end
    end
 end
@@ -223,6 +287,10 @@ function Ins:write(buf)
       error("bad instruction ["..tostring(op).."] (op mode unknown)")
    end
 end
+function Ins:is_call()
+   local op = self[1]
+   return op >= BC.CALLM and op <= BC.CALLT
+end
 
 KObj = class { __name = 'KObj' }
 function KObj:__init(v)
@@ -242,9 +310,7 @@ function KObj:write(buf)
 end
 function KObj:write_string(buf, v)
    buf:put_uleb128(KOBJ.STR + #v)
-   for i=1, #v do
-      buf:put(string.byte(v, i))
-   end
+   buf:put_bytes(v)
 end
 function KObj:write_table(buf, v)
    local seen = { }
@@ -258,29 +324,7 @@ function KNum:__init(v)
    self[1] = v
 end
 function KNum:write(buf)
-   local v, s, m, e = self[1], 0
-   if v < 0 then s, v = 1, -v end
-
-   if v == 0 then
-      m, e = 0, 0
-   elseif v == 1/0 then
-      m, e = 0, 0x7ff -- inf
-   elseif v ~= v then
-      m, e = 1, 0x7ff -- NaN
-   else
-      m, e = math.frexp(v) -- we lose precision here :(
-      m, e = (m * 2 - 1) * 2^52, e + 1022
-   end
-
-   local u64 = s * 2^64 + e * 2^52 + m
-   local u32_lo = u64 % 0x100000000
-   local u32_hi = math.floor(u64 / 0x100000000)
-
-   buf:put_uleb128(1 + 2 * u32_lo) -- 33 bits with lsb set
-   if u32_lo >= 0x80000000 then
-      buf[-1] = bit.bor(buf[-1], 0x10)
-   end
-   buf:put_uleb128(u32_hi)
+   buf:put_number(self[1])
 end
 
 Reg = class {
@@ -289,8 +333,12 @@ Reg = class {
    top = -1;
    idx = -1;
 }
+function Reg:__tostring()
+   return 'Reg#'..self.rid
+end
 function Reg:__init(proto)
    self.proto = proto
+   self.rid = genid()
 end
 function Reg:sync(ctx, pc)
    if ctx == self.proto then
@@ -316,7 +364,9 @@ function List:__init(proto)
    self.proto = proto
 end
 function List:sync(ctx, pc)
-   for i=1, #self do self[i]:sync(ctx, pc) end
+   for i=1, #self do
+      self[i]:sync(ctx, pc)
+   end
 end
 
 Rest = class { __name = 'Rest' }
@@ -379,6 +429,8 @@ function Proto:const(val)
          self.kcache[val] = item
          self.knum[#self.knum + 1] = item
       end
+   else
+      error("not a const: "..tostring(val))
    end
    return self.kcache[val].idx
 end
@@ -391,6 +443,7 @@ end
 function Proto:emit(op, a, b, c)
    local ins = Ins(op, a, b, c)
    self.code[#self.code + 1] = ins
+   --print("about to sync ins: ", ins, "at:", #self.code)
    ins:sync(self, #self.code)
    self.lninfo[#self.lninfo + 1] = self.currline
    return ins
@@ -412,23 +465,33 @@ function Proto:write(buf)
       end
    end
 
-   local ofs = #buf
+   local body = Buf.new()
    if has_child then
       self:emit(BC.UCLO, 0, 0) -- close upvals
    end
    self:emit(BC.RET0, 0, 1)
-   self:write_head(buf)
-   self:write_body(buf)
 
-   local len = #buf - ofs
-   buf:put_uleb128(len, ofs + 1) -- length of the proto
+   self:write_body(body)
+
+   local offs = body.offs
+   self:write_debug(body)
+
+   local head = Buf.new()
+   self:write_head(head, body.offs - offs)
+
+   buf:put_uleb128(head.offs + body.offs) -- length of the proto
+
+   local head_pack = ffi.string(head.data, head.offs)
+   local body_pack = ffi.string(body.data, body.offs)
+   buf:put_bytes(head_pack)
+   buf:put_bytes(body_pack)
 
    if DEBUG then
       local fun = assert(loadstring(buf:pack()))
       require("jit.bc").dump(fun)
    end
 end
-function Proto:write_head(buf)
+function Proto:write_head(buf, size_debug)
    buf:put(self.flags)
    buf:put(#self.params)
    buf:put(self.framesize)
@@ -436,7 +499,7 @@ function Proto:write_head(buf)
    buf:put_uleb128(#self.kobj)
    buf:put_uleb128(#self.knum)
    buf:put_uleb128(#self.code)
-   self.ofsdbg = #buf
+   buf:put_uleb128(size_debug or 0)
    buf:put_uleb128(self.firstline)
    buf:put_uleb128(self.numlines)
 end
@@ -464,10 +527,8 @@ function Proto:write_body(buf)
    for i=1, #self.knum do
       self.knum[i]:write(buf)   
    end
-   self:write_debug(buf)
 end
 function Proto:write_debug(buf)
-   local ofs = #buf
    local first = self.firstline
    if self.numlines < 256 then
       for i=1, #self.lninfo do
@@ -487,18 +548,17 @@ function Proto:write_debug(buf)
    end
    for i=1, #self.upvals do
       local uval = self.upvals[i]
-      buf:put_literal(uval.name.."\0")
+      buf:put_bytes(uval.name.."\0")
    end
    local lastpc = 0
    for i=1, #self.locals do
       local var = self.locals[i]
       local startpc, endpc = (var.bot or 0), (var.top or 0) + 1
-      buf:put_literal(var.name.."\0")
+      buf:put_bytes(var.name.."\0")
       buf:put_uleb128(startpc - lastpc)
       buf:put_uleb128(endpc - startpc)
       lastpc = startpc
    end
-   buf:put_uleb128(#buf - ofs, self.ofsdbg + 1)
 end
 function Proto:alloc_vars()
    local vstack, free, size = self.vstack, 0, 0
@@ -583,7 +643,7 @@ function Proto:here(name)
    end
    return name
 end
-function Proto:goto(name)
+function Proto:jump(name)
    if self.labels[name] then
       -- backward jump
       local offs = self.labels[name]
@@ -591,7 +651,7 @@ function Proto:goto(name)
    else
       -- forward jump
       self.labels[name] = #self.code + 1
-      return self:emit(BC.JMP, self:reg(), 'JUMP')
+      return self:emit(BC.JMP, self:reg(), NO_JMP)
    end
 end
 function Proto:op_jump(delta)
@@ -599,7 +659,7 @@ function Proto:op_jump(delta)
 end
 -- branch if condition
 function Proto:op_test(cond, a, here)
-   return self:emit(cond and BC.IST or BC.ISF, 0, a), self:goto(here)
+   return self:emit(cond and BC.IST or BC.ISF, 0, a), self:jump(here)
 end
 -- branch if comparison
 function Proto:op_comp(cond, a, b, here)
@@ -628,7 +688,7 @@ function Proto:op_comp(cond, a, b, here)
          cond = cond..'V'
       end
    end
-   return self:emit(BC['IS'..cond], a, b), self:goto(here)
+   return self:emit(BC['IS'..cond], a, b), self:jump(here)
 end
 function Proto:op_eq(a, b, here)
    return self:op_comp('EQ', a, b, here)
@@ -804,6 +864,9 @@ function Proto:op_varg(list, want)
    return self:emit(BC.VARG, base, want or 1, list)
 end
 function Proto:op_call(base, want, args)
+   if type(args) == 'table' then
+      base.args = args
+   end
    if args == 0 then
       return self:emit(BC.CALLM, base, want or 1, #self.params)
    elseif type(args) == 'table' and args.varg then
@@ -813,7 +876,45 @@ function Proto:op_call(base, want, args)
    end
 end
 function Proto:op_tailcall(base, args)
-
+   if type(args) == 'table' then
+      base.args = args
+   end
+   if args == 0 then
+      return self:emit(BC.CALLMT, base, #self.params)
+   elseif type(args) == 'table' and args.varg then
+      return self:emit(BC.CALLMT, base, args)
+   else
+      return self:emit(BC.CALLT, base, args or 1)
+   end
+end
+function Proto:op_fori(base, stop, step)
+   if not step then
+      step = self:reg()
+      self:op_loadk(step, 1)
+   end
+   local loop = self:emit(BC.FORI, base, NO_JMP)
+   stop:sync(self, #self.code)
+   step:sync(self, #self.code)
+   self:here(loop)
+   return loop
+end
+function Proto:op_forl(loop)
+   local offs = self.labels[loop]
+   loop[3] = #self.code - offs
+   return self:emit(BC.FORL, self:reg(), offs - #self.code)
+end
+function Proto:op_iterc(base, want, args)
+   error("NYI: ITERC")
+   self:emit(BC.ITERC, base, want or 1, args)
+end
+function Proto:op_iterl(loop)
+   error("NYI: ITERL")
+end
+function Proto:op_concat(base, list)
+   for i=1, #list do
+      list[i]:sync(self, #self.code)
+   end
+   return self:emit(BC.CAT, base, list[1], list[#list])
 end
 
 Dump = class {
@@ -843,29 +944,29 @@ function Dump:write_header(buf)
          name = '(binary)'
       end
       buf:put_uleb128(#name)
-      buf:put_literal(name)
+      buf:put_bytes(name)
    end
 end
 function Dump:write_footer(buf)
    buf:put(0x00)
 end
 function Dump:pack()
-   local buf = Buf()
+   local buf = Buf.new()
    self:write_header(buf)
    self.main:write(buf)
    self:write_footer(buf)
    return buf:pack()
 end
 
-module(...)
-
-_M.Buf   = Buf;
-_M.Ins   = Ins;
-_M.Reg   = Reg;
-_M.List  = List;
-_M.Rest  = Rest;
-_M.KNum  = KNum;
-_M.KObj  = KObj;
-_M.Proto = Proto;
-_M.Dump  = Dump;
+return {
+   Buf   = Buf;
+   Ins   = Ins;
+   Reg   = Reg;
+   List  = List;
+   Rest  = Rest;
+   KNum  = KNum;
+   KObj  = KObj;
+   Proto = Proto;
+   Dump  = Dump;
+}
 
